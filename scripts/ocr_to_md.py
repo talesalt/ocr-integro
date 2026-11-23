@@ -1,93 +1,55 @@
 #!/usr/bin/env python3
 """Converte PDF/imagens em .md com o minimo de trabalho: paginas com texto bom sao
-extraidas direto; so as ruins/escaneadas vao para OCR. Imprime 1 linha por arquivo.
+extraidas direto; so as ruins/escaneadas vao para OCR. O motor e escolhido pelas amostras
+(PT -> DharmaOCR, longo/outro idioma -> Unlimited-OCR, sem GPU -> Tesseract).
+Imprime 1 linha por arquivo.
 
-Uso: python ocr_to_md.py <arquivos|pastas> [-o pasta_saida] [--engine auto|unlimited|tesseract]
+Uso: python ocr_to_md.py <arquivos|pastas> [-o saida] [--engine auto|dharma|unlimited|tesseract]
        [--force-ocr] [--dpi 200] [--lang por]
-engine auto = Unlimited-OCR 2 se instalado (setup_unlimited.ps1), senao Tesseract.
 """
-import argparse, json, os, subprocess, sys, tempfile, shutil
+import argparse, os, sys, tempfile, shutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from textq import quality
+import engines
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-BASE = os.environ.get("OCR_INTEGRO_HOME", os.path.join(os.path.expanduser("~"), ".cache", "ocr-integro"))
-UPY = os.path.join(BASE, "venv-uocr", "Scripts" if os.name == "nt" else "bin",
-                   "python.exe" if os.name == "nt" else "python")
 IMG_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
-def tesseract_bin():
-    t = shutil.which("tesseract")
-    if not t and os.name == "nt":
-        c = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        t = c if os.path.exists(c) else None
-    return t
-
-
-def pick_engine(want):
-    if want in ("unlimited", "auto") and os.path.exists(UPY):
-        return "unlimited"
-    if want == "unlimited":
-        sys.exit("Unlimited-OCR nao instalado. Rode scripts/setup_unlimited.ps1")
-    if tesseract_bin():
-        return "tesseract"
-    sys.exit("Nenhum motor de OCR: rode setup_unlimited.ps1 ou instale o Tesseract (lang por).")
-
-
-def ocr_images(images, engine, lang):
-    if not images:
-        return []
-    if engine == "unlimited":
-        tmp = tempfile.mkdtemp(prefix="ocrmd_")
-        cfg = os.path.join(tmp, "cfg.json")
-        out = os.path.join(tmp, "out.json")
-        json.dump({"images": images, "out": out}, open(cfg, "w", encoding="utf-8"))
-        r = subprocess.run([UPY, os.path.join(HERE, "uocr_worker.py"), cfg],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if r.returncode != 0 or not os.path.exists(out):
-            tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
-            raise RuntimeError("Unlimited-OCR falhou: " + " | ".join(tail))
-        return json.load(open(out, encoding="utf-8"))["pages"]
-    t = tesseract_bin()
-    res = []
-    for img in images:
-        r = subprocess.run([t, img, "stdout", "-l", lang, "--psm", "3"], capture_output=True,
-                           text=True, encoding="utf-8", errors="replace")
-        res.append(r.stdout.strip())
-    return res
-
-
-def convert_pdf(path, engine_want, force, dpi, lang):
+def convert_pdf(path, want, force, dpi, lang):
     try:
         import pymupdf as fitz
     except ImportError:
         import fitz
     doc = fitz.open(path)
-    pages, need = [None] * doc.page_count, []
+    pages, need, good = [None] * doc.page_count, [], []
     tmp = tempfile.mkdtemp(prefix="ocrpg_")
     for i, pg in enumerate(doc):
         txt = "" if force else pg.get_text()
         if not force and quality(txt)["verdict"] == "OK":
             pages[i] = txt.strip()
+            good.append(txt)
         else:
             f = os.path.join(tmp, f"p{i+1:04d}.png")
             pg.get_pixmap(dpi=dpi).save(f)
             need.append((i, f))
-    engine = "-"
+    eng, why = "-", "texto extraido direto"
     if need:
-        engine = pick_engine(engine_want)
-        for (i, _), t in zip(need, ocr_images([f for _, f in need], engine, lang)):
+        imgs = [f for _, f in need]
+        pr = engines.probe(imgs, lang=lang) if want == "auto" else {}
+        if good and pr:
+            pr["texts"] = good[:2] + pr["texts"]
+        eng, why = engines.choose(pr, len(need), want)
+        for (i, _), t in zip(need, engines.run(eng, imgs, lang)[0]):
             pages[i] = t
     shutil.rmtree(tmp, ignore_errors=True)
-    return pages, len(need), engine
+    return pages, len(need), eng, why
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+")
     ap.add_argument("-o", "--out", help="pasta de saida (padrao: ao lado do arquivo)")
-    ap.add_argument("--engine", default="auto", choices=["auto", "unlimited", "tesseract"])
+    ap.add_argument("--engine", default="auto", choices=["auto", "dharma", "unlimited", "tesseract"])
     ap.add_argument("--force-ocr", action="store_true", help="OCR em todas as paginas")
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--lang", default="por", help="idioma do Tesseract (ex: por+eng)")
@@ -104,10 +66,11 @@ def main():
         ext = os.path.splitext(f)[1].lower()
         try:
             if ext == ".pdf":
-                pages, nocr, eng = convert_pdf(f, a.engine, a.force_ocr, a.dpi, a.lang)
+                pages, nocr, eng, why = convert_pdf(f, a.engine, a.force_ocr, a.dpi, a.lang)
             elif ext in IMG_EXT:
-                eng = pick_engine(a.engine)
-                pages, nocr = ocr_images([os.path.abspath(f)], eng, a.lang), 1
+                img = os.path.abspath(f)
+                eng, why = engines.choose(engines.probe([img], 1, a.lang) if a.engine == "auto" else {}, 1, a.engine)
+                pages, nocr = engines.run(eng, [img], a.lang)[0], 1
             else:
                 print(f"IGNORADO\t{f}")
                 continue
@@ -119,9 +82,8 @@ def main():
             md = os.path.join(od, name + ".md")
             body = "\n\n".join(f"<!-- pagina {i+1} -->\n\n{t or ''}" for i, t in enumerate(pages))
             with open(md, "w", encoding="utf-8") as h:
-                h.write(f"# {name}\n\n<!-- fonte: {os.path.basename(f)} | ocr: {nocr}/{len(pages)} pag | motor: {eng} -->\n\n{body}\n")
-            q = quality(body)
-            print(f"OK\t{md}\tpaginas={len(pages)} ocr={nocr} motor={eng} qualidade={q['verdict']}")
+                h.write(f"# {name}\n\n<!-- fonte: {os.path.basename(f)} | ocr: {nocr}/{len(pages)} pag | motor: {eng} ({why}) -->\n\n{body}\n")
+            print(f"OK\t{md}\tpaginas={len(pages)} ocr={nocr} motor={eng} ({why}) qualidade={quality(body)['verdict']}")
         except Exception as e:
             ok = False
             print(f"ERRO\t{f}\t{str(e)[:200]}")

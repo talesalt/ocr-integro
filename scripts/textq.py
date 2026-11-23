@@ -43,3 +43,42 @@ def quality(text: str) -> dict:
     if why:
         m["why"] = "; ".join(why)
     return m
+
+
+PT = set("""de que não uma os do da em para com se na por mais as dos como mas foi ao das
+tem à seu sua ou ser quando muito há nos já está também só pelo pela até isso ela entre era
+depois sem mesmo aos ter seus quem nas esse eles estão você essa num nem suas meu às minha""".split())
+EN = set("""the of and to in is that for it on with as are this by be was from at or an have
+not which but they his her their has had were been will would there what about""".split())
+
+
+def lang_guess(text: str) -> str:
+    """'pt', 'en' ou '?' pela frequencia de palavras funcionais."""
+    w = [x.lower() for x in WORD.findall(text or "")]
+    if len(w) < 20:
+        return "?"
+    p = sum(x in PT for x in w)
+    e = sum(x in EN for x in w)
+    if p > 1.5 * e and p / len(w) > 0.05:
+        return "pt"
+    if e > 1.5 * p and e / len(w) > 0.05:
+        return "en"
+    return "?"
+
+
+SUP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+_FIELD = re.compile(r"<!--\s*(cabecalho|margem|rodape):\s*(.*?)\s*-->|\n---\n(.*)$", re.S)
+
+
+def dedupe_fields(md: str, thr: float = 0.7) -> str:
+    """Remove cabecalho/rodape que repetem o corpo (falha conhecida do DharmaOCR)."""
+    body = _FIELD.sub(" ", md)
+    bw = set(w.lower() for w in WORD.findall(body.translate(SUP)))
+
+    def keep(m):
+        txt = m.group(2) if m.group(2) is not None else m.group(3)
+        ws = [w.lower() for w in WORD.findall((txt or "").translate(SUP))]
+        if ws and sum(w in bw for w in ws) / len(ws) >= thr:
+            return ""
+        return m.group(0)
+    return re.sub(r"\n{3,}", "\n\n", _FIELD.sub(keep, md)).strip()
